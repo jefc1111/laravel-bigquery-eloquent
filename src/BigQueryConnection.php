@@ -31,7 +31,10 @@ class BigQueryConnection extends Connection
 
         $this->client = new BigQueryClient([
             'projectId' => $this->projectId,
-            'keyFilePath' => (string) ($config['key_file'] ?? ''),
+            // Google\Cloud\Core\ClientTrait::getKeyFile() checks for `keyFile` first 
+            // and `keyFilePath` next
+            'keyFile' => (array) $config['key_file_as_assoc_array'] ?? '',
+            'keyFilePath' => (string) ($config['key_file_path'] ?? ''),    
         ]);
 
         $this->database = $this->dataset;
