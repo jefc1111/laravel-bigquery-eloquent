@@ -127,7 +127,7 @@ class BigQueryConnection extends Connection
      * @param bool $useReadPdo
      * @return array
      */
-    public function select($query, $bindings = [], $useReadPdo = true): array
+    public function select($query, $bindings = [], $useReadPdo = true, array $fetchUsing = []): array
     {
         $job = $this->client->query($query);
 
