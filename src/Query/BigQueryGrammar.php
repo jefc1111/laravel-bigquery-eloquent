@@ -2,56 +2,184 @@
 
 namespace NomanSheikh\LaravelBigqueryEloquent\Query;
 
-use Illuminate\Database\Query\Expression;
+use Illuminate\Contracts\Database\Query\Expression;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Grammars\Grammar;
+use Illuminate\Support\Collection;
+use LogicException;
 use NomanSheikh\LaravelBigqueryEloquent\BigQueryConnection;
+use Override;
 
-/**
- * @property BigQueryConnection $connection
- */
 class BigQueryGrammar extends Grammar
 {
+    protected string $projectId;
+
+    protected string $dataset;
+
+    public function __construct(BigQueryConnection $connection)
+    {
+        parent::__construct($connection);
+
+        $this->projectId = $connection->getProjectId();
+        $this->dataset = $connection->getDefaultDataset();
+    }
+
+    #[Override]
     public function wrapTable($table, $prefix = null): string
     {
         if ($table instanceof Expression) {
-            return $this->getValue($table);
+            return (string) $this->getValue($table);
         }
 
-        // Handle explicit aliases
-        if (stripos($table, ' as ') !== false) {
-            [$name, $alias] = preg_split('/\s+as\s+/i', $table);
+        $segments = preg_split('/\s+as\s+/i', (string) $table, 2);
 
-            return $this->wrapTable(trim($name)) . ' as ' . $this->wrap(trim($alias));
+        if ($segments === false || count($segments) < 2) {
+            return $this->wrapSegments(explode('.', $this->qualifyTable((string) $table)));
         }
 
-        // Already wrapped in backticks
-        if (str_starts_with($table, '`') && str_ends_with($table, '`')) {
+        return "{$this->wrapTable($segments[0])} as {$this->wrapValue($segments[1])}";
+    }
+
+    /**
+     * Each path segment is wrapped on its own. A backtick-quoted `a.b.c` is a single
+     * identifier whose implicit alias is that whole string, while `a`.`b`.`c` is a path
+     * whose implicit alias is the last segment - which is what columns qualify against.
+     */
+    protected function qualifyTable(string $table): string
+    {
+        if (str_contains($table, '.')) {
             return $table;
         }
 
-        // Fully or partially qualified table (e.g., dataset.table or project.dataset.table)
-        if (str_contains($table, '.')) {
-            return "`" . trim($table, '`') . "`";
-        }
-
-        // Unqualified table name -> prepend project and dataset
-        $project = $this->connection->getProjectId();
-        $dataset = $this->connection->getDefaultDataset();
-
-        return "`$project.$dataset.$table`";
+        return "{$this->projectId}.{$this->dataset}.{$table}";
     }
 
-    public function wrap($value)
+    /**
+     * BigQuery has no escape sequence for a backtick inside a quoted identifier,
+     * so the delimiters are stripped rather than doubled.
+     */
+    #[Override]
+    protected function wrapValue($value): string
     {
-        if ($value instanceof Expression) {
-            return $this->getValue($value);
-        }
-
-        if ($value === '*' || str_contains($value, '.') || str_contains($value, '`')) {
+        if ($value === '*') {
             return $value;
         }
 
-        // Wrap normal columns, including timestamps, without table prefix
-        return "`$value`";
+        return '`'.str_replace(['`', "\n", "\r"], '', (string) $value).'`';
+    }
+
+    /**
+     * @param  array<int, string>  $segments
+     */
+    #[Override]
+    protected function wrapSegments($segments): string
+    {
+        return (new Collection($segments))->map($this->wrapValue(...))->implode('.');
+    }
+
+    #[Override]
+    protected function wrapJsonSelector($value): string
+    {
+        [$field, $path] = $this->wrapJsonFieldAndPath($value);
+
+        return "json_value({$field}{$path})";
+    }
+
+    #[Override]
+    public function getDateFormat(): string
+    {
+        return 'Y-m-d H:i:s.u';
+    }
+
+    #[Override]
+    public function compileSelect(Builder $query): string
+    {
+        if ($query->offset !== null) {
+            $query->limit ??= PHP_INT_MAX;
+        }
+
+        if ($query->unionOffset !== null) {
+            $query->unionLimit ??= PHP_INT_MAX;
+        }
+
+        return parent::compileSelect($query);
+    }
+
+    #[Override]
+    public function compileRandom($seed): string
+    {
+        return 'rand()';
+    }
+
+    /**
+     * @param  array<string, mixed>  $where
+     */
+    #[Override]
+    protected function whereDate(Builder $query, $where): string
+    {
+        return "date({$this->wrap($where['column'])}) {$where['operator']} cast({$this->parameter($where['value'])} as date)";
+    }
+
+    /**
+     * @param  array<string, mixed>  $where
+     */
+    #[Override]
+    protected function whereTime(Builder $query, $where): string
+    {
+        return "time({$this->wrap($where['column'])}) {$where['operator']} cast({$this->parameter($where['value'])} as time)";
+    }
+
+    /**
+     * Laravel zero-pads day and month bindings into strings, so the parameter is cast
+     * back to INT64 to match what EXTRACT returns.
+     *
+     * @param  array<string, mixed>  $where
+     */
+    #[Override]
+    protected function dateBasedWhere($type, Builder $query, $where): string
+    {
+        return "extract({$type} from {$this->wrap($where['column'])}) {$where['operator']} cast({$this->parameter($where['value'])} as int64)";
+    }
+
+    #[Override]
+    protected function compileUpdateWithoutJoins(Builder $query, $table, $columns, $where): string
+    {
+        return "update {$table} set {$columns} ".$this->requireWhere($where);
+    }
+
+    #[Override]
+    protected function compileDeleteWithoutJoins(Builder $query, $table, $where): string
+    {
+        return "delete from {$table} ".$this->requireWhere($where);
+    }
+
+    /**
+     * BigQuery rejects UPDATE and DELETE statements that have no WHERE clause.
+     */
+    protected function requireWhere(string $where): string
+    {
+        if ($where !== '') {
+            return $where;
+        }
+
+        return 'where true';
+    }
+
+    #[Override]
+    protected function compileUpdateWithJoins(Builder $query, $table, $columns, $where): never
+    {
+        throw new LogicException('BigQuery does not support joins in UPDATE statements. Write a MERGE statement and run it with DB::connection()->statement().');
+    }
+
+    #[Override]
+    protected function compileDeleteWithJoins(Builder $query, $table, $where): never
+    {
+        throw new LogicException('BigQuery does not support joins in DELETE statements. Use a subquery in the WHERE clause instead.');
+    }
+
+    #[Override]
+    protected function compileLock(Builder $query, $value): never
+    {
+        throw new LogicException('BigQuery does not support row locking.');
     }
 }

@@ -15,11 +15,15 @@
 
 ## Features
 
-- **Eloquent Integration**: Use BigQuery tables as Eloquent models.
+- **Eloquent Integration**: Use BigQuery tables as Eloquent models, including relations, `find()`, aggregates, and pagination.
 - **Dedicated BigQuery Driver**: Optimized database driver for BigQuery.
 - **Automatic Fully Qualified Table Names**: Handles `project.dataset.table` formatting transparently.
-- **Custom Query Grammar**: Generates SQL optimized for BigQuery syntax.
-- **Read-Only Support**: Supports SELECT queries (read operations only).
+- **Custom Query Grammar**: Generates GoogleSQL — `EXTRACT` for date parts, `RAND()`, `JSON_VALUE()`, and correctly backtick-quoted identifiers.
+- **Full DML Support**: `select`, `insert`, `update`, and `delete` via Eloquent or the raw query builder, executed as BigQuery DML.
+- **Raw Statements**: `DB::statement()`, `DB::select()`, `DB::update()`, `DB::cursor()`, and `DB::pretend()` all work against BigQuery.
+- **Bindings That Just Work**: `Carbon` / `DateTimeInterface` values are auto-wrapped as BigQuery `Timestamp`, microseconds are preserved, and `null` bindings are handled.
+- **Native Values Unwrapped**: `TIMESTAMP`, `DATE`, `NUMERIC`, `BYTES`, and nested `STRUCT`/`ARRAY` values arrive as plain PHP values that Eloquent casts understand.
+- **Cost Controls**: Per-connection `maximum_bytes_billed`, `job_timeout_ms`, and job `labels`.
 - **Flexible Authentication**: Supports Application Default Credentials (ADC) and service account key files.
 - **Environment Configuration**: Easy setup via environment variables.
 
@@ -28,7 +32,7 @@
 ## Requirements
 
 - PHP 8.3 or higher
-- Laravel 10.x, 11.x, or 12.x
+- Laravel 12.x or 13.x
 - Access to Google Cloud BigQuery API
 - Google Cloud authentication (Application Default Credentials recommended)
 
@@ -51,7 +55,7 @@ composer require nomansheikh/laravel-bigquery-eloquent
 Run the following Artisan command to publish the package config:
 
 ```bash
-php artisan vendor:publish --provider="NomanSheikh\LaravelBigqueryEloquent\LaravelBigqueryEloquentServiceProvider"
+php artisan vendor:publish --tag="bigquery-eloquent-config"
 ```
 
 ### 2. Authentication Setup
@@ -66,18 +70,18 @@ The package supports Google Cloud's recommended authentication hierarchy:
   - Download a JSON key file from Google Cloud Console.
   - Set the `BIGQUERY_KEY_FILE` environment variable pointing to the JSON file (not recommended for production).
 
-#### Authentication Hierarchy
+#### How credentials are resolved
 
-The Google Client library authenticates in this order:
+`key_file` accepts either a path to a JSON key file or the credentials array itself.
+If it is set, it is used directly. If it is empty or absent, the Google client falls
+back to Application Default Credentials, which it resolves in this order:
 
-1. `key_file` specified in the database config.
-2. `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
-3. Default credential file locations.
-4. Google App Engine built-in service account.
-5. Google Compute Engine built-in service account.
-6. Direct credentials array in config.
+1. The `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+2. The well-known ADC file (`gcloud auth application-default login` writes this).
+3. The App Engine built-in service account.
+4. The Compute Engine / GKE / Cloud Run metadata service.
 
-Example direct credentials array in `config/database.php`:
+Example credentials array in `config/database.php`:
 
 ```php
 'bigquery' => [
@@ -105,6 +109,14 @@ Add the following to your `.env` file:
 ```env
 BIGQUERY_PROJECT_ID=your-project-id
 BIGQUERY_DATASET=your-dataset-name
+
+# Required for datasets outside the US multi-region, e.g. "EU" or "asia-northeast1"
+# BIGQUERY_LOCATION=EU
+
+# Optional cost and runtime guards
+# BIGQUERY_MAXIMUM_BYTES_BILLED=10737418240
+# BIGQUERY_JOB_TIMEOUT_MS=60000
+
 # Optional: Only if using service account key file (not recommended for production)
 # BIGQUERY_KEY_FILE=path/to/your/service-account-key.json
 ```
@@ -121,11 +133,28 @@ Add the BigQuery connection in `config/database.php`:
         'driver'     => 'bigquery',
         'project_id' => env('BIGQUERY_PROJECT_ID', ''),
         'dataset'    => env('BIGQUERY_DATASET', ''),
+
+        // The region the dataset lives in. Queries against a dataset outside the
+        // US multi-region fail unless this is set.
+        'location'   => env('BIGQUERY_LOCATION'),
+
+        // Cancels a query before it is billed if the planner estimates it will
+        // scan more than this many bytes.
+        'maximum_bytes_billed' => env('BIGQUERY_MAXIMUM_BYTES_BILLED'),
+
+        'job_timeout_ms' => env('BIGQUERY_JOB_TIMEOUT_MS'),
+
+        // Attached to every job, useful for attributing BigQuery spend.
+        'labels' => ['service' => 'my-app'],
+
         // Optional: Only if using service account key file (not recommended)
         'key_file'   => env('BIGQUERY_KEY_FILE', ''),
     ],
 ],
 ```
+
+Every key also has a package-level default in `config/bigquery-eloquent.php`, which is used
+when the connection itself does not define it.
 
 ---
 
@@ -133,24 +162,33 @@ Add the BigQuery connection in `config/database.php`:
 
 ### Models
 
-Create models by extending `BigQueryModel` to interact with BigQuery tables:
+Extend `BigQueryModel` to interact with BigQuery tables. Because BigQuery has no auto-incrementing
+primary keys, `BigQueryModel` defaults to `$incrementing = false` and `$keyType = 'string'`, so
+models assign their own keys (typically a ULID or UUID):
 
 ```php
 <?php
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
 use NomanSheikh\LaravelBigqueryEloquent\Eloquent\BigQueryModel;
 
 class UserAnalytics extends BigQueryModel
 {
+    use HasUlids;
+
     protected $table = 'user_analytics'; // Automatically prefixed with project.dataset
+
+    protected $fillable = ['user_id', 'page_views', 'session_duration'];
 }
 ```
 
-### Queries
+> **Timestamps.** Eloquent's timestamps are on by default, so the BigQuery table needs
+> `created_at` and `updated_at` `TIMESTAMP` columns. Set `public $timestamps = false;`
+> on the model if it does not have them, otherwise every write fails.
 
-Perform queries using familiar Eloquent methods:
+### Reading
 
 ```php
 // Basic query
@@ -171,9 +209,74 @@ $stats = UserAnalytics::selectRaw('
 ')->first();
 ```
 
+### Writing
+
+`insert`, `update`, and `delete` are executed as BigQuery DML statements. Be aware of [BigQuery's DML quotas](https://cloud.google.com/bigquery/quotas#dml) — DML is intended for batch and analytical workloads, not high-frequency OLTP writes.
+
+```php
+// Insert via Eloquent
+$row = UserAnalytics::create([
+    'user_id'          => 'usr_42',
+    'page_views'       => 17,
+    'session_duration' => 312,
+]);
+
+// Update
+UserAnalytics::where('user_id', 'usr_42')->update(['page_views' => 18]);
+
+// Delete
+UserAnalytics::where('user_id', 'usr_42')->delete();
+
+// Batch insert via the query builder
+DB::connection('bigquery')->table('project.dataset.user_analytics')->insert([
+    ['user_id' => 'usr_1', 'page_views' => 5],
+    ['user_id' => 'usr_2', 'page_views' => 9],
+]);
+```
+
+#### Binding types
+
+`Carbon` / `DateTimeInterface` values are wrapped as a BigQuery `Timestamp`, preserving
+microseconds. That is the right type for a `TIMESTAMP` column, but BigQuery will not
+compare a `TIMESTAMP` parameter against a `DATE`, `DATETIME`, or `TIME` column, and it
+will not compare a `STRING` parameter against a `NUMERIC` column:
+
+```
+No matching signature for operator = for argument types: DATE, TIMESTAMP
+```
+
+The driver cannot infer the column type from a PHP value, so pass the matching BigQuery
+value object for those columns. They are forwarded to the API untouched:
+
+```php
+$client = DB::connection('bigquery')->getClient();
+
+UserAnalytics::where('signup_date', $client->date(now()))->get();       // DATE
+UserAnalytics::where('clock_in', $client->time(now()))->get();          // TIME
+UserAnalytics::where('revenue', $client->numeric('1250.75'))->get();    // NUMERIC
+UserAnalytics::where('blob', $client->bytes($binary))->get();           // BYTES
+```
+
+`whereDate()`, `whereMonth()`, `whereYear()` and `whereTime()` already cast their
+parameters, so they work on `TIMESTAMP` and `DATE` columns without this.
+
+#### Reading values
+
+BigQuery's SDK value objects are unwrapped before they reach your model, so `$casts`
+behaves normally:
+
+| BigQuery type | PHP value |
+| --- | --- |
+| `TIMESTAMP` / `DATETIME` | string, microsecond precision, castable to `datetime` |
+| `DATE` / `TIME` | `Y-m-d` / `H:i:s.u` string |
+| `NUMERIC` / `BIGNUMERIC` | string, so precision a float would lose is kept |
+| `BYTES` | raw binary string |
+| `JSON` / `GEOGRAPHY` | string |
+| `STRUCT` / `ARRAY` | array, unwrapped recursively |
+
 ### Raw Queries
 
-Execute raw SQL queries directly via the BigQuery connection:
+Execute raw SQL directly via the BigQuery connection:
 
 ```php
 use Illuminate\Support\Facades\DB;
@@ -182,13 +285,56 @@ $results = DB::connection('bigquery')->select(
     'SELECT user_id, COUNT(*) as visits FROM `project.dataset.user_analytics` WHERE created_at >= ?',
     [now()->subDays(7)]
 );
+
+// DDL and any other statement BigQuery accepts
+DB::connection('bigquery')->statement(
+    'CREATE TABLE IF NOT EXISTS `project.dataset.user_analytics` (user_id STRING, page_views INT64)'
+);
+
+// Stream a large result set without buffering it
+foreach (DB::connection('bigquery')->cursor('SELECT * FROM `project.dataset.events`') as $row) {
+    // ...
+}
+
+// See the SQL without running (and paying for) the query
+$queries = DB::connection('bigquery')->pretend(
+    fn () => UserAnalytics::where('page_views', '>', 100)->get()
+);
 ```
 
 ---
 
 ## Limitations
 
-- **BigQuery Specific**: Designed specifically for Google BigQuery and may not be compatible with other database drivers.
+These are inherent BigQuery characteristics, not bugs in the package:
+
+- **No transactions.** `DB::transaction()`, `beginTransaction()`, `commit()`, and `rollBack()` throw `LogicException`. BigQuery supports session-scoped transactions but they are not wired up here.
+- **No auto-incrementing primary keys.** Assign your own key (ULID/UUID). `insertGetId()` throws `LogicException` to make this explicit.
+- **DML, not streaming.** Inserts, updates, and deletes execute as DML statements and are subject to [BigQuery's DML quotas](https://cloud.google.com/bigquery/quotas#dml). For high-volume ingestion, use a batch load job or the streaming insert API directly via the underlying `BigQueryClient` (`DB::connection('bigquery')->getClient()`).
+- **No row locking.** `lockForUpdate()` and `sharedLock()` throw `LogicException`.
+- **No joins in `UPDATE` / `DELETE`.** BigQuery has no such syntax; both throw `LogicException`. Use a `MERGE` statement via `DB::connection('bigquery')->statement()`, or a subquery in the `WHERE` clause.
+- **No `upsert()`.** Write a `MERGE` statement instead.
+- **Limited schema builder.** `Schema::hasTable()` and `Schema::getColumnListing()` work (via `INFORMATION_SCHEMA`; fork addition). `Schema::create()` and the other schema methods throw `LogicException`. Run DDL with `DB::connection('bigquery')->statement()`.
+- **No PDO.** `getPdo()` / `getReadPdo()` throw `LogicException`. Code or third-party packages that introspect the underlying PDO will not work.
+- **BigQuery-specific driver.** Not interchangeable with other Laravel database drivers.
+
+---
+
+## Upgrading from v2 to v3
+
+v3 fixes identifier quoting and column qualification, which changes the SQL the package emits.
+
+- **Identifiers are backtick-quoted per segment.** `t.user_id` compiles to `` `t`.`user_id` ``, and a table compiles to `` `project`.`dataset`.`table` `` rather than `` `project.dataset.table` ``. The single-quoted form is one identifier as far as BigQuery is concerned, so its implicit alias is the whole `project.dataset.table` string and `table.column` does not resolve. Identifiers containing backticks now have them stripped rather than being interpolated verbatim, which closes an injection hole in `orderBy()` / `where()` when the column name came from request input.
+- **Columns are qualified with the table reference, not the full path.** `Model::find()`, relations, and `withCount()` previously emitted `project.dataset.table.column`, which BigQuery rejects. They now emit `table.column`.
+- **`get()` returns `stdClass` rows**, matching Laravel's query builder contract, instead of arrays. Eloquent models are unaffected.
+- **BigQuery value objects are unwrapped.** `TIMESTAMP`, `DATE`, `NUMERIC`, and `BYTES` columns hydrate as PHP strings rather than `Google\Cloud\BigQuery\*` objects, so `$casts` works as expected.
+- **`BigQueryModel` defaults to `$incrementing = false` and `$keyType = 'string'`.** Models that already set these are unaffected.
+- **`delete($id)` now scopes to that key** instead of ignoring the argument and deleting everything matching the current constraints.
+- **The empty `LaravelBigqueryEloquent` class, its facade, and the `LaravelBigqueryEloquent` alias were removed.** None of them were ever functional.
+- **`lockForUpdate()` and `sharedLock()` now throw.** They previously compiled to nothing and silently returned unlocked rows.
+- **`update()` and `delete()` with joins now throw.** They previously emitted MySQL-shaped SQL that BigQuery rejects, pointing you at `MERGE` instead.
+- **`BYTES` columns hydrate as a raw binary string** rather than a PSR-7 stream object.
+- **Laravel 11 is no longer supported.** Its query grammar has no reference to the connection, so the driver could never resolve `project.dataset` for an unqualified table name on 11. Laravel 11 reached end of life on 2026-03-12.
 
 ---
 
@@ -200,11 +346,23 @@ Run the test suite with:
 composer test
 ```
 
+The suite mocks the BigQuery client, so it verifies the SQL the driver emits but not
+that BigQuery accepts it. A live smoke test covers the rest:
+
+```bash
+BIGQUERY_SMOKE_PROJECT=your-project composer test-smoke
+```
+
+It creates a throwaway `laravel_bq_smoke_*` dataset, exercises reads, writes, and the
+BigQuery-specific SQL against it, then drops the dataset. Nothing outside that dataset
+is written to. It needs a billing-enabled project — the BigQuery sandbox does not
+support DML — and scans a few megabytes, well inside the 1 TiB monthly free tier.
+
 ---
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING](CONTRIBUTING.md) for guidelines.
+Contributions are welcome. Please open an issue or a pull request.
 
 ---
 
